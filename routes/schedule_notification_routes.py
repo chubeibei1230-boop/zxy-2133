@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from models import db, ScheduleNotification, DutyAssignment, Substitution, User, LeaveAffectedAssignment
+from models import db, ScheduleNotification, DutyAssignment, Substitution, User, LeaveAffectedAssignment, UserStatus
 from auth import login_required, role_required
 from datetime import datetime, timedelta
 
@@ -23,6 +23,10 @@ def send_notification():
     target_user = User.query.get(data['user_id'])
     if not target_user:
         return jsonify({'error': '目标用户不存在'}), 404
+
+    target_status = _get_user_current_status(data['user_id'])
+    if target_status != 'active':
+        return jsonify({'error': f'目标用户当前状态为{target_status}，不应出现在待确认排班通知中'}), 409
 
     existing = ScheduleNotification.query.filter(
         ScheduleNotification.duty_assignment_id == data['duty_assignment_id'],
@@ -98,6 +102,11 @@ def send_batch_notifications():
             results.append({'error': '排班记录不存在或已取消', 'duty_assignment_id': assignment_id})
             continue
 
+        item_status = _get_user_current_status(user_id)
+        if item_status != 'active':
+            results.append({'error': f'用户当前状态为{item_status}，不可发送通知', 'duty_assignment_id': assignment_id, 'user_id': user_id})
+            continue
+
         existing = ScheduleNotification.query.filter(
             ScheduleNotification.duty_assignment_id == assignment_id,
             ScheduleNotification.user_id == user_id,
@@ -168,6 +177,10 @@ def confirm(n_id):
 
     if notification.status != 'pending_confirm':
         return jsonify({'error': f'当前状态为{notification.status}，无法确认'}), 400
+
+    user_status = _get_user_current_status(user.id)
+    if user_status != 'active':
+        return jsonify({'error': f'您当前状态为{user_status}，无法确认排班通知'}), 409
 
     assignment = notification.assignment
     if not assignment or assignment.status == 'cancelled':
@@ -349,6 +362,13 @@ def _expire_overdue_notifications():
             expired_count += 1
             continue
 
+        notification_user_status = _get_user_current_status(n.user_id)
+        if notification_user_status != 'active' and n.status != 'confirmed':
+            n.status = 'expired'
+            n.expired_at = now
+            expired_count += 1
+            continue
+
         if n.notify_type == 'assignment' and n.status == 'confirmed':
             approved_sub = Substitution.query.filter(
                 Substitution.duty_assignment_id == a.id,
@@ -453,3 +473,15 @@ def _handle_leave_fill_rejection(notification):
         if sub and sub.status == 'approved':
             sub.status = 'rejected'
             sub.reviewed_at = datetime.utcnow()
+
+
+def _get_user_current_status(user_id):
+    latest = UserStatus.query.filter(
+        UserStatus.user_id == user_id
+    ).order_by(UserStatus.created_at.desc()).first()
+    if not latest:
+        return 'active'
+    now = datetime.utcnow()
+    if latest.end_time and latest.end_time <= now:
+        return 'active'
+    return latest.status

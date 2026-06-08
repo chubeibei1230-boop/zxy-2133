@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from models import db, DutyAssignment, User, ServicePoint, ScheduleNotification, ServicePointDeactivation
+from models import db, DutyAssignment, User, ServicePoint, ScheduleNotification, ServicePointDeactivation, UserStatus
 from auth import login_required, role_required
 from conflict import detect_all_conflicts, log_conflicts, _shift_deactivation_overlaps
 from datetime import datetime
@@ -27,6 +27,10 @@ def create():
         return jsonify({'error': '用户不存在'}), 404
     if not ServicePoint.query.get(data['service_point_id']):
         return jsonify({'error': '服务点不存在'}), 404
+
+    target_user_status = _get_user_current_status(target_user_id)
+    if target_user_status != 'active':
+        return jsonify({'error': f'该人员当前状态为{target_user_status}，不可新建排班'}), 409
 
     is_cross_day = data.get('is_cross_day', False)
     start = data['start_time']
@@ -266,3 +270,15 @@ def cancel(a_id):
 
     db.session.commit()
     return jsonify({'message': '排班已取消，占用时段已释放'}), 200
+
+
+def _get_user_current_status(user_id):
+    latest = UserStatus.query.filter(
+        UserStatus.user_id == user_id
+    ).order_by(UserStatus.created_at.desc()).first()
+    if not latest:
+        return 'active'
+    now = datetime.utcnow()
+    if latest.end_time and latest.end_time <= now:
+        return 'active'
+    return latest.status

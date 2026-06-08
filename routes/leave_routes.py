@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from models import (db, LeaveRequest, LeaveAffectedAssignment, DutyAssignment,
-                    User, ServicePoint, Substitution, ScheduleNotification, ConflictLog)
+                    User, ServicePoint, Substitution, ScheduleNotification, ConflictLog, UserStatus)
 from auth import login_required, role_required
 from conflict import (detect_all_conflicts, log_conflicts, get_effective_assignments,
                       check_substitution_overlap, check_over_limit_conflict,
@@ -216,6 +216,8 @@ def recommend_substitutes(leave_id):
 
     all_staff = User.query.filter(User.role == 'staff', User.id != leave.user_id).all()
 
+    active_staff = [s for s in all_staff if _get_user_current_status(s.id) == 'active']
+
     recommendations = []
     for la in affected:
         assignment = la.assignment
@@ -223,7 +225,7 @@ def recommend_substitutes(leave_id):
             continue
 
         candidates = []
-        for staff in all_staff:
+        for staff in active_staff:
             overlapping_leaves = LeaveRequest.query.filter(
                 LeaveRequest.user_id == staff.id,
                 LeaveRequest.status.in_(['pending', 'approved']),
@@ -298,6 +300,8 @@ def auto_fill(leave_id):
 
     all_staff = User.query.filter(User.role == 'staff', User.id != leave.user_id).all()
 
+    active_staff = [s for s in all_staff if _get_user_current_status(s.id) == 'active']
+
     used_substitutes = {}
     results = []
     warnings = []
@@ -311,7 +315,7 @@ def auto_fill(leave_id):
             continue
 
         candidates = []
-        for staff in all_staff:
+        for staff in active_staff:
             overlapping_leaves = LeaveRequest.query.filter(
                 LeaveRequest.user_id == staff.id,
                 LeaveRequest.status.in_(['pending', 'approved']),
@@ -446,6 +450,10 @@ def manual_assign(leave_id, la_id):
         return jsonify({'error': '替班人员不存在'}), 404
     if sub_user.id == leave.user_id:
         return jsonify({'error': '不能指定请假人自己为替班人员'}), 400
+
+    sub_user_status = _get_user_current_status(sub_user.id)
+    if sub_user_status != 'active':
+        return jsonify({'error': f'替班人员当前状态为{sub_user_status}，不可作为补位候选人'}), 409
 
     assignment = la.assignment
     if not assignment:
@@ -723,3 +731,15 @@ def _serialize_affected(la):
             'status': assignment.status
         } if assignment else None
     }
+
+
+def _get_user_current_status(user_id):
+    latest = UserStatus.query.filter(
+        UserStatus.user_id == user_id
+    ).order_by(UserStatus.created_at.desc()).first()
+    if not latest:
+        return 'active'
+    now = datetime.utcnow()
+    if latest.end_time and latest.end_time <= now:
+        return 'active'
+    return latest.status

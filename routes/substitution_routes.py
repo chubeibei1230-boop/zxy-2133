@@ -1,7 +1,8 @@
 from flask import Blueprint, request, jsonify
-from models import db, Substitution, DutyAssignment, User, ScheduleNotification
+from models import db, Substitution, DutyAssignment, User, ScheduleNotification, UserStatus
 from auth import login_required, role_required
 from conflict import check_substitution_overlap, log_conflicts
+from datetime import datetime
 
 sub_bp = Blueprint('substitutions', __name__, url_prefix='/api/substitutions')
 
@@ -23,6 +24,10 @@ def create():
     sub_user = User.query.get(data['substitute_user_id'])
     if not sub_user:
         return jsonify({'error': '替班人员不存在'}), 404
+
+    sub_user_status = _get_user_current_status(data['substitute_user_id'])
+    if sub_user_status != 'active':
+        return jsonify({'error': f'替班人员当前状态为{sub_user_status}，不可作为替班候选人'}), 409
 
     original_user_id = assignment.user_id
     if user.role not in ('admin',) and original_user_id != user.id:
@@ -180,3 +185,15 @@ def reject(s_id):
     s.reviewed_at = datetime.utcnow()
     db.session.commit()
     return jsonify({'message': '替班申请已驳回'}), 200
+
+
+def _get_user_current_status(user_id):
+    latest = UserStatus.query.filter(
+        UserStatus.user_id == user_id
+    ).order_by(UserStatus.created_at.desc()).first()
+    if not latest:
+        return 'active'
+    now = datetime.utcnow()
+    if latest.end_time and latest.end_time <= now:
+        return 'active'
+    return latest.status

@@ -168,7 +168,7 @@ class ConflictLog(db.Model):
 
     @staticmethod
     def valid_conflict_types():
-        return ['cross_point', 'over_limit', 'substitution_overlap', 'leave_unfilled', 'leave_conflict', 'deactivation']
+        return ['cross_point', 'over_limit', 'substitution_overlap', 'leave_unfilled', 'leave_conflict', 'deactivation', 'user_status']
 
 
 class LeaveRequest(db.Model):
@@ -254,3 +254,46 @@ class DeactivationAffectedShift(db.Model):
     @staticmethod
     def valid_handle_statuses():
         return ['pending', 'reassigned_sp', 'reassigned_user', 'cancelled']
+
+
+class UserStatus(db.Model):
+    __tablename__ = 'user_statuses'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='active')
+    effective_time = db.Column(db.DateTime, nullable=False)
+    end_time = db.Column(db.DateTime, nullable=True)
+    reason = db.Column(db.Text, nullable=False)
+    remark = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+
+    user = db.relationship('User', foreign_keys=[user_id], backref='status_records')
+    creator = db.relationship('User', foreign_keys=[created_by])
+    affected_assignments = db.relationship('StatusAffectedAssignment', backref='user_status', lazy='dynamic',
+                                           cascade='all, delete-orphan')
+
+    @staticmethod
+    def valid_statuses():
+        return ['active', 'disabled', 'frozen']
+
+
+class StatusAffectedAssignment(db.Model):
+    __tablename__ = 'status_affected_assignments'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_status_id = db.Column(db.Integer, db.ForeignKey('user_statuses.id'), nullable=False)
+    duty_assignment_id = db.Column(db.Integer, db.ForeignKey('duty_assignments.id'), nullable=False)
+    handle_status = db.Column(db.String(30), nullable=False, default='pending')
+    new_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    handle_remark = db.Column(db.Text)
+    handled_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    duty_assignment = db.relationship('DutyAssignment', backref='status_affected')
+    new_user = db.relationship('User', foreign_keys=[new_user_id])
+
+    @staticmethod
+    def valid_handle_statuses():
+        return ['pending', 'reassigned', 'cancelled']

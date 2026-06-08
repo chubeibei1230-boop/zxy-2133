@@ -1,4 +1,4 @@
-from models import DutyAssignment, Substitution, ServicePoint, ConflictLog, ServicePointDeactivation, db
+from models import DutyAssignment, Substitution, ServicePoint, ConflictLog, ServicePointDeactivation, UserStatus, db
 from datetime import datetime, timedelta
 
 
@@ -377,6 +377,31 @@ def _shift_deactivation_overlaps(shift_date, shift_start, shift_end, shift_cross
     return True
 
 
+def check_user_status_conflict(user_id):
+    conflicts = []
+    latest = UserStatus.query.filter(
+        UserStatus.user_id == user_id
+    ).order_by(UserStatus.created_at.desc()).first()
+    if not latest:
+        return conflicts
+    now = datetime.utcnow()
+    if latest.end_time and latest.end_time <= now:
+        return conflicts
+    if latest.status in ('disabled', 'frozen'):
+        user = User.query.get(user_id)
+        user_name = user.name if user else f'ID={user_id}'
+        conflicts.append({
+            'type': 'user_status',
+            'user_id': user_id,
+            'current_status': latest.status,
+            'description': (
+                f'人员"{user_name}"(ID={user_id})当前状态为{latest.status}'
+                f'（原因：{latest.reason}），不可参与排班'
+            )
+        })
+    return conflicts
+
+
 def detect_all_conflicts(user_id, service_point_id, date, start_time, end_time,
                          is_cross_day=False, exclude_id=None,
                          is_substitution=False, substitute_user_id=None):
@@ -397,6 +422,9 @@ def detect_all_conflicts(user_id, service_point_id, date, start_time, end_time,
 
     deactivation = check_deactivation_conflict(service_point_id, date, start_time, end_time, is_cross_day)
     all_conflicts.extend(deactivation)
+
+    user_status = check_user_status_conflict(user_id)
+    all_conflicts.extend(user_status)
 
     return all_conflicts
 

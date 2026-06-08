@@ -8,5 +8,6 @@ from .conflict_routes import conflict_bp
 from .schedule_notification_routes import sn_bp
 from .leave_routes import leave_bp
 from .deactivation_routes import deact_bp
+from .user_status_routes import us_bp
 
-all_blueprints = [auth_bp, sp_bp, st_bp, da_bp, sub_bp, att_bp, conflict_bp, sn_bp, leave_bp, deact_bp]
+all_blueprints = [auth_bp, sp_bp, st_bp, da_bp, sub_bp, att_bp, conflict_bp, sn_bp, leave_bp, deact_bp, us_bp]
