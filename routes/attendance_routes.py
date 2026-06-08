@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from models import db, AttendanceRecord, DutyAssignment
+from models import db, AttendanceRecord, DutyAssignment, ServicePointDeactivation
 from auth import login_required, role_required
 from datetime import datetime, timedelta
 
@@ -30,6 +30,23 @@ def check_in():
 
     if assignment.status == 'cancelled':
         return jsonify({'error': '已取消的排班不能签到'}), 400
+
+    active_deact = ServicePointDeactivation.query.filter(
+        ServicePointDeactivation.service_point_id == assignment.service_point_id,
+        ServicePointDeactivation.status == 'active',
+        ServicePointDeactivation.start_date <= assignment.date,
+        ServicePointDeactivation.end_date >= assignment.date
+    ).first()
+    if active_deact:
+        return jsonify({
+            'error': '该服务点已停用，不能签到',
+            'deactivation': {
+                'id': active_deact.id,
+                'start_date': active_deact.start_date,
+                'end_date': active_deact.end_date,
+                'reason': active_deact.reason
+            }
+        }), 409
 
     existing = AttendanceRecord.query.filter_by(duty_assignment_id=assignment.id).first()
     if existing and existing.check_in_time:

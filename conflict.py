@@ -1,4 +1,4 @@
-from models import DutyAssignment, Substitution, ServicePoint, ConflictLog, db
+from models import DutyAssignment, Substitution, ServicePoint, ConflictLog, ServicePointDeactivation, db
 from datetime import datetime, timedelta
 
 
@@ -320,6 +320,29 @@ def check_substitution_overlap(substitute_user_id, date, start_time, end_time, i
     return conflicts
 
 
+def check_deactivation_conflict(service_point_id, date):
+    conflicts = []
+    active_deact = ServicePointDeactivation.query.filter(
+        ServicePointDeactivation.service_point_id == service_point_id,
+        ServicePointDeactivation.status == 'active',
+        ServicePointDeactivation.start_date <= date,
+        ServicePointDeactivation.end_date >= date
+    ).first()
+    if active_deact:
+        sp = ServicePoint.query.get(service_point_id)
+        conflicts.append({
+            'type': 'deactivation',
+            'deactivation_id': active_deact.id,
+            'service_point_id': service_point_id,
+            'description': (
+                f'服务点"{sp.name}"(ID={service_point_id})在{date}处于停用状态 '
+                f'(停用ID={active_deact.id}，{active_deact.start_date}至{active_deact.end_date}，'
+                f'原因：{active_deact.reason})'
+            )
+        })
+    return conflicts
+
+
 def detect_all_conflicts(user_id, service_point_id, date, start_time, end_time,
                          is_cross_day=False, exclude_id=None,
                          is_substitution=False, substitute_user_id=None):
@@ -337,6 +360,9 @@ def detect_all_conflicts(user_id, service_point_id, date, start_time, end_time,
         sub_overlap = check_substitution_overlap(substitute_user_id, date, start_time, end_time,
                                                  is_cross_day, exclude_id)
         all_conflicts.extend(sub_overlap)
+
+    deactivation = check_deactivation_conflict(service_point_id, date)
+    all_conflicts.extend(deactivation)
 
     return all_conflicts
 

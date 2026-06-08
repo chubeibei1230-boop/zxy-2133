@@ -168,7 +168,7 @@ class ConflictLog(db.Model):
 
     @staticmethod
     def valid_conflict_types():
-        return ['cross_point', 'over_limit', 'substitution_overlap', 'leave_unfilled', 'leave_conflict']
+        return ['cross_point', 'over_limit', 'substitution_overlap', 'leave_unfilled', 'leave_conflict', 'deactivation']
 
 
 class LeaveRequest(db.Model):
@@ -208,3 +208,47 @@ class LeaveAffectedAssignment(db.Model):
     @staticmethod
     def valid_fill_statuses():
         return ['pending', 'filling', 'filled', 'unfilled', 'conflict']
+
+
+class ServicePointDeactivation(db.Model):
+    __tablename__ = 'service_point_deactivations'
+
+    id = db.Column(db.Integer, primary_key=True)
+    service_point_id = db.Column(db.Integer, db.ForeignKey('service_points.id'), nullable=False)
+    start_date = db.Column(db.String(10), nullable=False)
+    end_date = db.Column(db.String(10), nullable=False)
+    reason = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='active')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    cancelled_at = db.Column(db.DateTime)
+
+    service_point = db.relationship('ServicePoint', backref='deactivations')
+    affected_shifts = db.relationship('DeactivationAffectedShift', backref='deactivation', lazy='dynamic',
+                                     cascade='all, delete-orphan')
+
+    @staticmethod
+    def valid_statuses():
+        return ['active', 'cancelled']
+
+
+class DeactivationAffectedShift(db.Model):
+    __tablename__ = 'deactivation_affected_shifts'
+
+    id = db.Column(db.Integer, primary_key=True)
+    deactivation_id = db.Column(db.Integer, db.ForeignKey('service_point_deactivations.id'), nullable=False)
+    duty_assignment_id = db.Column(db.Integer, db.ForeignKey('duty_assignments.id'), nullable=False)
+    handle_status = db.Column(db.String(30), nullable=False, default='pending')
+    handle_type = db.Column(db.String(30))
+    new_service_point_id = db.Column(db.Integer, db.ForeignKey('service_points.id'), nullable=True)
+    new_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    handle_remark = db.Column(db.Text)
+    handled_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    duty_assignment = db.relationship('DutyAssignment', backref='deactivation_affected')
+    new_service_point = db.relationship('ServicePoint', foreign_keys=[new_service_point_id])
+    new_user = db.relationship('User', foreign_keys=[new_user_id])
+
+    @staticmethod
+    def valid_handle_statuses():
+        return ['pending', 'reassigned_sp', 'reassigned_user', 'cancelled']

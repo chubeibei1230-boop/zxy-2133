@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from models import db, DutyAssignment, User, ServicePoint, ScheduleNotification
+from models import db, DutyAssignment, User, ServicePoint, ScheduleNotification, ServicePointDeactivation
 from auth import login_required, role_required
 from conflict import detect_all_conflicts, log_conflicts
 from datetime import datetime
@@ -27,6 +27,23 @@ def create():
         return jsonify({'error': '用户不存在'}), 404
     if not ServicePoint.query.get(data['service_point_id']):
         return jsonify({'error': '服务点不存在'}), 404
+
+    active_deact = ServicePointDeactivation.query.filter(
+        ServicePointDeactivation.service_point_id == data['service_point_id'],
+        ServicePointDeactivation.status == 'active',
+        ServicePointDeactivation.start_date <= data['date'],
+        ServicePointDeactivation.end_date >= data['date']
+    ).first()
+    if active_deact:
+        return jsonify({
+            'error': '该服务点在指定日期已停用，不允许新增排班',
+            'deactivation': {
+                'id': active_deact.id,
+                'start_date': active_deact.start_date,
+                'end_date': active_deact.end_date,
+                'reason': active_deact.reason
+            }
+        }), 409
 
     is_cross_day = data.get('is_cross_day', False)
     start = data['start_time']
