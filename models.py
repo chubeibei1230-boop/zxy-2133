@@ -22,6 +22,7 @@ class User(db.Model):
     substitute_substitutions = db.relationship(
         'Substitution', foreign_keys='Substitution.substitute_user_id', backref='substitute_user', lazy='dynamic'
     )
+    leave_requests = db.relationship('LeaveRequest', backref='user', lazy='dynamic')
     inspections = db.relationship('AttendanceRecord', backref='inspector', lazy='dynamic')
 
     @staticmethod
@@ -80,6 +81,7 @@ class DutyAssignment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     substitutions = db.relationship('Substitution', backref='assignment', lazy='dynamic')
+    leave_affected = db.relationship('LeaveAffectedAssignment', backref='assignment', lazy='dynamic')
     attendance = db.relationship('AttendanceRecord', backref='assignment', lazy='joined', uselist=False)
 
     @staticmethod
@@ -146,7 +148,7 @@ class ScheduleNotification(db.Model):
 
     @staticmethod
     def valid_notify_types():
-        return ['assignment', 'substitution']
+        return ['assignment', 'substitution', 'leave_fill']
 
 
 class ConflictLog(db.Model):
@@ -166,4 +168,43 @@ class ConflictLog(db.Model):
 
     @staticmethod
     def valid_conflict_types():
-        return ['cross_point', 'over_limit', 'substitution_overlap']
+        return ['cross_point', 'over_limit', 'substitution_overlap', 'leave_unfilled', 'leave_conflict']
+
+
+class LeaveRequest(db.Model):
+    __tablename__ = 'leave_requests'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    reason = db.Column(db.Text, nullable=False)
+    start_date = db.Column(db.String(10), nullable=False)
+    end_date = db.Column(db.String(10), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='pending')
+    admin_comment = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    reviewed_at = db.Column(db.DateTime)
+
+    affected_assignments = db.relationship('LeaveAffectedAssignment', backref='leave_request', lazy='dynamic',
+                                          cascade='all, delete-orphan')
+
+    @staticmethod
+    def valid_statuses():
+        return ['pending', 'approved', 'rejected', 'cancelled']
+
+
+class LeaveAffectedAssignment(db.Model):
+    __tablename__ = 'leave_affected_assignments'
+
+    id = db.Column(db.Integer, primary_key=True)
+    leave_request_id = db.Column(db.Integer, db.ForeignKey('leave_requests.id'), nullable=False)
+    duty_assignment_id = db.Column(db.Integer, db.ForeignKey('duty_assignments.id'), nullable=False)
+    fill_status = db.Column(db.String(20), nullable=False, default='pending')
+    substitute_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    fill_confirmed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    substitute_user = db.relationship('User', foreign_keys=[substitute_user_id])
+
+    @staticmethod
+    def valid_fill_statuses():
+        return ['pending', 'filling', 'filled', 'unfilled', 'conflict']
