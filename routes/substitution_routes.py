@@ -147,7 +147,7 @@ def approve(s_id):
     original_notifications = ScheduleNotification.query.filter(
         ScheduleNotification.duty_assignment_id == s.duty_assignment_id,
         ScheduleNotification.user_id == s.original_user_id,
-        ScheduleNotification.status.in_(['unnotified', 'pending_confirm'])
+        ScheduleNotification.status.in_(['unnotified', 'pending_confirm', 'confirmed'])
     ).all()
     for n in original_notifications:
         n.status = 'expired'

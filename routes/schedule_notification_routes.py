@@ -183,6 +183,8 @@ def confirm(n_id):
 
     notification.status = 'confirmed'
     notification.confirmed_at = datetime.utcnow()
+
+    assignment.status = 'confirmed'
     db.session.commit()
 
     return jsonify({'message': '排班通知已确认', 'id': notification.id, 'status': notification.status}), 200
@@ -203,7 +205,9 @@ def reject(n_id):
         return jsonify({'error': f'当前状态为{notification.status}，无法拒绝'}), 400
 
     data = request.get_json()
-    reject_reason = data.get('reject_reason') if data else None
+    if not data or not data.get('reject_reason') or not data.get('reject_reason').strip():
+        return jsonify({'error': '拒绝原因为必填项'}), 400
+    reject_reason = data.get('reject_reason').strip()
 
     assignment = notification.assignment
     if not assignment or assignment.status == 'cancelled':
@@ -241,20 +245,25 @@ def list_all():
         query = query.filter(ScheduleNotification.user_id == user_id)
 
     service_point_id = request.args.get('service_point_id')
-    if service_point_id:
-        query = query.join(DutyAssignment).filter(DutyAssignment.service_point_id == service_point_id)
-
     date = request.args.get('date')
-    if date:
-        query = query.join(DutyAssignment).filter(DutyAssignment.date == date)
-
     date_from = request.args.get('date_from')
-    if date_from:
-        query = query.join(DutyAssignment).filter(DutyAssignment.date >= date_from)
-
     date_to = request.args.get('date_to')
+
+    needs_join = service_point_id or date or date_from or date_to
+    if needs_join:
+        query = query.join(DutyAssignment, ScheduleNotification.duty_assignment_id == DutyAssignment.id)
+
+    if service_point_id:
+        query = query.filter(DutyAssignment.service_point_id == service_point_id)
+
+    if date:
+        query = query.filter(DutyAssignment.date == date)
+
+    if date_from:
+        query = query.filter(DutyAssignment.date >= date_from)
+
     if date_to:
-        query = query.join(DutyAssignment).filter(DutyAssignment.date <= date_to)
+        query = query.filter(DutyAssignment.date <= date_to)
 
     status = request.args.get('status')
     if status:
@@ -319,7 +328,7 @@ def _expire_overdue_notifications():
     today = now.date()
 
     active_notifications = ScheduleNotification.query.filter(
-        ScheduleNotification.status.in_(['unnotified', 'pending_confirm'])
+        ScheduleNotification.status.in_(['unnotified', 'pending_confirm', 'confirmed'])
     ).all()
 
     expired_count = 0
@@ -337,6 +346,17 @@ def _expire_overdue_notifications():
             expired_count += 1
             continue
 
+        if n.notify_type == 'assignment' and n.status == 'confirmed':
+            approved_sub = Substitution.query.filter(
+                Substitution.duty_assignment_id == a.id,
+                Substitution.status == 'approved'
+            ).first()
+            if approved_sub and approved_sub.original_user_id == n.user_id:
+                n.status = 'expired'
+                n.expired_at = now
+                expired_count += 1
+                continue
+
         if n.notify_type == 'substitution' and n.substitution_id:
             sub = Substitution.query.get(n.substitution_id)
             if sub and sub.status == 'rejected':
@@ -345,7 +365,7 @@ def _expire_overdue_notifications():
                 expired_count += 1
                 continue
 
-        if _is_past_check_in(a, now):
+        if n.status != 'confirmed' and _is_past_check_in(a, now):
             n.status = 'expired'
             n.expired_at = now
             expired_count += 1

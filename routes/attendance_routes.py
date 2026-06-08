@@ -23,6 +23,11 @@ def check_in():
         if not sub:
             return jsonify({'error': '只能为本人排班签到'}), 403
 
+    if assignment.user_id == user.id and user.role not in ('admin',):
+        approved_sub = assignment.substitutions.filter_by(status='approved').first()
+        if approved_sub:
+            return jsonify({'error': '该排班已被替班，原值守人不能签到'}), 403
+
     if assignment.status == 'cancelled':
         return jsonify({'error': '已取消的排班不能签到'}), 400
 
