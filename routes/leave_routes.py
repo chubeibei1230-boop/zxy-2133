@@ -3,6 +3,7 @@ from models import (db, LeaveRequest, LeaveAffectedAssignment, DutyAssignment,
                     User, ServicePoint, Substitution, ScheduleNotification, ConflictLog)
 from auth import login_required, role_required
 from conflict import (detect_all_conflicts, log_conflicts, get_effective_assignments,
+                      check_substitution_overlap, check_over_limit_conflict,
                       get_substitute_user_id, intervals_overlap, time_to_minutes)
 from datetime import datetime
 
@@ -232,16 +233,23 @@ def recommend_substitutes(leave_id):
             if overlapping_leaves:
                 continue
 
-            conflicts = detect_all_conflicts(
-                user_id=staff.id,
+            conflicts = check_substitution_overlap(
+                substitute_user_id=staff.id,
+                date=assignment.date,
+                start_time=assignment.start_time,
+                end_time=assignment.end_time,
+                is_cross_day=assignment.is_cross_day,
+                exclude_id=assignment.id
+            )
+            over_limit = check_over_limit_conflict(
                 service_point_id=assignment.service_point_id,
                 date=assignment.date,
                 start_time=assignment.start_time,
                 end_time=assignment.end_time,
                 is_cross_day=assignment.is_cross_day,
-                is_substitution=True,
-                substitute_user_id=staff.id
+                exclude_id=assignment.id
             )
+            conflicts.extend(over_limit)
 
             same_sp_exp = DutyAssignment.query.filter(
                 DutyAssignment.user_id == staff.id,
@@ -313,16 +321,23 @@ def auto_fill(leave_id):
             if overlapping_leaves:
                 continue
 
-            conflicts = detect_all_conflicts(
-                user_id=staff.id,
+            conflicts = check_substitution_overlap(
+                substitute_user_id=staff.id,
+                date=assignment.date,
+                start_time=assignment.start_time,
+                end_time=assignment.end_time,
+                is_cross_day=assignment.is_cross_day,
+                exclude_id=assignment.id
+            )
+            over_limit = check_over_limit_conflict(
                 service_point_id=assignment.service_point_id,
                 date=assignment.date,
                 start_time=assignment.start_time,
                 end_time=assignment.end_time,
                 is_cross_day=assignment.is_cross_day,
-                is_substitution=True,
-                substitute_user_id=staff.id
+                exclude_id=assignment.id
             )
+            conflicts.extend(over_limit)
 
             same_sp_exp = DutyAssignment.query.filter(
                 DutyAssignment.user_id == staff.id,
@@ -362,11 +377,12 @@ def auto_fill(leave_id):
             used_substitutes[assignment.date].add(best['user_id'])
         elif best and best['has_conflict']:
             la.fill_status = 'conflict'
+            la.substitute_user_id = best['user_id']
             conflict_count += 1
             log_conflicts(
                 [{'type': 'leave_conflict',
-                  'description': f'请假ID={leave.id}自动补位：班次ID={assignment.id}的推荐替班人员均存在冲突'}],
-                leave.user_id, assignment.service_point_id, assignment.date, assignment.id
+                  'description': f'请假ID={leave.id}自动补位：推荐替班人员ID={best["user_id"]}({best["user_name"]})存在排班冲突，班次ID={assignment.id}'}],
+                best['user_id'], assignment.service_point_id, assignment.date, assignment.id
             )
             results.append({
                 'leave_affected_id': la.id,
@@ -382,7 +398,7 @@ def auto_fill(leave_id):
             unfilled_count += 1
             log_conflicts(
                 [{'type': 'leave_unfilled',
-                  'description': f'请假ID={leave.id}自动补位：班次ID={assignment.id}无可用替班人员'}],
+                  'description': f'请假ID={leave.id}(员工ID={leave.user_id})自动补位：班次ID={assignment.id}无可用替班人员'}],
                 leave.user_id, assignment.service_point_id, assignment.date, assignment.id
             )
             results.append({
@@ -444,16 +460,23 @@ def manual_assign(leave_id, la_id):
     if overlapping_leaves:
         return jsonify({'error': f'替班人员{sub_user.name}在{assignment.date}也有请假申请，无法替班'}), 409
 
-    conflicts = detect_all_conflicts(
-        user_id=sub_user.id,
+    conflicts = check_substitution_overlap(
+        substitute_user_id=sub_user.id,
+        date=assignment.date,
+        start_time=assignment.start_time,
+        end_time=assignment.end_time,
+        is_cross_day=assignment.is_cross_day,
+        exclude_id=assignment.id
+    )
+    over_limit = check_over_limit_conflict(
         service_point_id=assignment.service_point_id,
         date=assignment.date,
         start_time=assignment.start_time,
         end_time=assignment.end_time,
         is_cross_day=assignment.is_cross_day,
-        is_substitution=True,
-        substitute_user_id=sub_user.id
+        exclude_id=assignment.id
     )
+    conflicts.extend(over_limit)
 
     force = data.get('force', False)
     if conflicts and not force:
@@ -535,20 +558,27 @@ def cancel_fill(leave_id, la_id):
 def statistics():
     from sqlalchemy import func
 
-    total = LeaveRequest.query.count()
-    by_status = db.session.query(
-        LeaveRequest.status, func.count(LeaveRequest.id)
-    ).group_by(LeaveRequest.status).all()
-    status_counts = {s: c for s, c in by_status}
-
-    affected_total = LeaveAffectedAssignment.query.count()
-    by_fill_status = db.session.query(
-        LeaveAffectedAssignment.fill_status, func.count(LeaveAffectedAssignment.id)
-    ).group_by(LeaveAffectedAssignment.fill_status).all()
-    fill_status_counts = {s: c for s, c in by_fill_status}
-
     date_from = request.args.get('date_from')
     date_to = request.args.get('date_to')
+
+    leave_query = LeaveRequest.query
+    if date_from or date_to:
+        leave_query = leave_query.join(LeaveAffectedAssignment).join(DutyAssignment)
+        if date_from:
+            leave_query = leave_query.filter(DutyAssignment.date >= date_from)
+        if date_to:
+            leave_query = leave_query.filter(DutyAssignment.date <= date_to)
+
+    total = leave_query.count()
+    by_status = db.session.query(
+        LeaveRequest.status, func.count(LeaveRequest.id)
+    ).join(LeaveAffectedAssignment).join(DutyAssignment)
+    if date_from:
+        by_status = by_status.filter(DutyAssignment.date >= date_from)
+    if date_to:
+        by_status = by_status.filter(DutyAssignment.date <= date_to)
+    by_status = by_status.group_by(LeaveRequest.status).all()
+    status_counts = {s: c for s, c in by_status}
 
     affected_query = LeaveAffectedAssignment.query
     if date_from or date_to:
@@ -557,6 +587,12 @@ def statistics():
             affected_query = affected_query.filter(DutyAssignment.date >= date_from)
         if date_to:
             affected_query = affected_query.filter(DutyAssignment.date <= date_to)
+
+    affected_total = affected_query.count()
+    by_fill_status = affected_query.with_entities(
+        LeaveAffectedAssignment.fill_status, func.count(LeaveAffectedAssignment.id)
+    ).group_by(LeaveAffectedAssignment.fill_status).all()
+    fill_status_counts = {s: c for s, c in by_fill_status}
 
     pending_fill = affected_query.filter(
         LeaveAffectedAssignment.fill_status == 'pending'
@@ -571,16 +607,21 @@ def statistics():
         LeaveAffectedAssignment.fill_status == 'conflict'
     ).count()
 
-    service_point_stats = db.session.query(
+    sp_query = db.session.query(
         ServicePoint.id, ServicePoint.name,
         func.count(LeaveAffectedAssignment.id)
     ).join(
         DutyAssignment, DutyAssignment.service_point_id == ServicePoint.id
     ).join(
         LeaveAffectedAssignment, LeaveAffectedAssignment.duty_assignment_id == DutyAssignment.id
-    ).group_by(ServicePoint.id, ServicePoint.name).all()
+    )
+    if date_from:
+        sp_query = sp_query.filter(DutyAssignment.date >= date_from)
+    if date_to:
+        sp_query = sp_query.filter(DutyAssignment.date <= date_to)
+    service_point_stats = sp_query.group_by(ServicePoint.id, ServicePoint.name).all()
 
-    recent_unfilled = LeaveAffectedAssignment.query.filter(
+    recent_unfilled = affected_query.filter(
         LeaveAffectedAssignment.fill_status.in_(['unfilled', 'conflict'])
     ).join(DutyAssignment).order_by(DutyAssignment.date).limit(10).all()
 

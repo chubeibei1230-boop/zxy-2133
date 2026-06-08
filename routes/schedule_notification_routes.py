@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from models import db, ScheduleNotification, DutyAssignment, Substitution, User
+from models import db, ScheduleNotification, DutyAssignment, Substitution, User, LeaveAffectedAssignment
 from auth import login_required, role_required
 from datetime import datetime, timedelta
 
@@ -224,6 +224,9 @@ def reject(n_id):
     notification.status = 'rejected'
     notification.reject_reason = reject_reason
     notification.confirmed_at = datetime.utcnow()
+
+    _handle_leave_fill_rejection(notification)
+
     db.session.commit()
 
     return jsonify({
@@ -365,6 +368,27 @@ def _expire_overdue_notifications():
                 expired_count += 1
                 continue
 
+        if n.notify_type == 'leave_fill':
+            la = LeaveAffectedAssignment.query.filter(
+                LeaveAffectedAssignment.duty_assignment_id == n.duty_assignment_id,
+                LeaveAffectedAssignment.substitute_user_id == n.user_id,
+                LeaveAffectedAssignment.fill_status.in_(['filled', 'conflict'])
+            ).first()
+            if la and n.status != 'confirmed':
+                if la.fill_status in ('filled', 'conflict'):
+                    la.fill_status = 'pending'
+                    la.substitute_user_id = None
+                    la.fill_confirmed_at = None
+                if n.substitution_id:
+                    sub = Substitution.query.get(n.substitution_id)
+                    if sub and sub.status == 'approved':
+                        sub.status = 'rejected'
+                        sub.reviewed_at = now
+                n.status = 'expired'
+                n.expired_at = now
+                expired_count += 1
+                continue
+
         if n.status != 'confirmed' and _is_past_check_in(a, now):
             n.status = 'expired'
             n.expired_at = now
@@ -408,3 +432,24 @@ def _is_past_check_in(assignment, now):
             return True
 
     return False
+
+
+def _handle_leave_fill_rejection(notification):
+    if notification.notify_type != 'leave_fill':
+        return
+
+    la = LeaveAffectedAssignment.query.filter(
+        LeaveAffectedAssignment.duty_assignment_id == notification.duty_assignment_id,
+        LeaveAffectedAssignment.substitute_user_id == notification.user_id,
+        LeaveAffectedAssignment.fill_status.in_(['filled', 'conflict'])
+    ).first()
+    if la:
+        la.fill_status = 'pending'
+        la.substitute_user_id = None
+        la.fill_confirmed_at = None
+
+    if notification.substitution_id:
+        sub = Substitution.query.get(notification.substitution_id)
+        if sub and sub.status == 'approved':
+            sub.status = 'rejected'
+            sub.reviewed_at = datetime.utcnow()
