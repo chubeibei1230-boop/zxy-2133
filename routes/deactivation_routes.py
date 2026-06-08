@@ -4,7 +4,8 @@ from models import (db, ServicePointDeactivation, DeactivationAffectedShift,
                     ConflictLog)
 from auth import login_required, role_required
 from conflict import (detect_all_conflicts, log_conflicts, check_cross_point_conflict,
-                      check_over_limit_conflict, intervals_overlap, time_to_minutes)
+                      check_over_limit_conflict, intervals_overlap, time_to_minutes,
+                      _shift_deactivation_overlaps)
 from datetime import datetime
 
 deact_bp = Blueprint('deactivations', __name__, url_prefix='/api/deactivations')
@@ -25,19 +26,31 @@ def create():
     if data['start_date'] > data['end_date']:
         return jsonify({'error': '开始日期不能晚于结束日期'}), 400
 
+    start_time = data.get('start_time', '00:00')
+    end_time = data.get('end_time', '23:59')
+
+    if not _validate_time(start_time) or not _validate_time(end_time):
+        return jsonify({'error': '时间格式错误，应为HH:MM'}), 400
+
     overlapping = ServicePointDeactivation.query.filter(
         ServicePointDeactivation.service_point_id == data['service_point_id'],
         ServicePointDeactivation.status == 'active',
         ServicePointDeactivation.start_date <= data['end_date'],
         ServicePointDeactivation.end_date >= data['start_date']
-    ).first()
-    if overlapping:
-        return jsonify({'error': '该服务点在指定时间范围内已有活跃的停用记录'}), 409
+    ).all()
+    for od in overlapping:
+        if _deactivation_periods_overlap(
+            data['start_date'], data['end_date'], start_time, end_time,
+            od.start_date, od.end_date, od.start_time, od.end_time
+        ):
+            return jsonify({'error': '该服务点在指定时间范围内已有活跃的停用记录'}), 409
 
     deactivation = ServicePointDeactivation(
         service_point_id=data['service_point_id'],
         start_date=data['start_date'],
         end_date=data['end_date'],
+        start_time=start_time,
+        end_time=end_time,
         reason=data['reason'],
         status='active'
     )
@@ -53,6 +66,9 @@ def create():
 
     affected_list = []
     for a in affected_assignments:
+        if not _shift_deactivation_overlaps(a.date, a.start_time, a.end_time, a.is_cross_day, deactivation):
+            continue
+
         existing = DeactivationAffectedShift.query.filter(
             DeactivationAffectedShift.duty_assignment_id == a.id,
             DeactivationAffectedShift.handle_status != 'cancelled'
@@ -240,9 +256,11 @@ def _handle_reassign_sp(das, assignment, data):
         ServicePointDeactivation.status == 'active',
         ServicePointDeactivation.start_date <= assignment.date,
         ServicePointDeactivation.end_date >= assignment.date
-    ).first()
-    if active_deact:
-        return jsonify({'error': f'目标服务点在{assignment.date}也处于停用状态，无法改派'}), 409
+    ).all()
+    for ad in active_deact:
+        if _shift_deactivation_overlaps(assignment.date, assignment.start_time, assignment.end_time,
+                                        assignment.is_cross_day, ad):
+            return jsonify({'error': f'目标服务点在{assignment.date}该时段也处于停用状态，无法改派'}), 409
 
     conflicts = detect_all_conflicts(
         user_id=assignment.user_id,
@@ -274,7 +292,7 @@ def _handle_reassign_sp(das, assignment, data):
     if conflicts:
         log_conflicts(conflicts, assignment.user_id, new_sp_id, assignment.date, assignment.id)
 
-    _notify_assignment_change(assignment, 'service_point_deactivation_reassign_sp')
+    _notify_assignment_change(assignment, 'assignment')
 
     db.session.commit()
 
@@ -291,6 +309,7 @@ def _handle_reassign_sp(das, assignment, data):
 
 def _handle_reassign_user(das, assignment, data):
     new_user_id = data.get('new_user_id')
+    new_sp_id = data.get('new_service_point_id')
     if not new_user_id:
         return jsonify({'error': '改派到其他人员需提供新人员ID'}), 400
 
@@ -298,9 +317,59 @@ def _handle_reassign_user(das, assignment, data):
     if not new_user:
         return jsonify({'error': '目标人员不存在'}), 404
 
+    deactivation = das.deactivation
+    if not new_sp_id:
+        active_deact = ServicePointDeactivation.query.filter(
+            ServicePointDeactivation.service_point_id == assignment.service_point_id,
+            ServicePointDeactivation.status == 'active',
+            ServicePointDeactivation.start_date <= assignment.date,
+            ServicePointDeactivation.end_date >= assignment.date
+        ).all()
+        still_deactivated = any(
+            _shift_deactivation_overlaps(assignment.date, assignment.start_time, assignment.end_time,
+                                         assignment.is_cross_day, ad)
+            for ad in active_deact
+        )
+        if still_deactivated:
+            return jsonify({'error': '当前服务点在班次时段内仍处于停用状态，必须同时指定新服务点'}), 400
+
+    if new_sp_id:
+        new_sp = ServicePoint.query.get(new_sp_id)
+        if not new_sp:
+            return jsonify({'error': '目标服务点不存在'}), 404
+
+        active_deact = ServicePointDeactivation.query.filter(
+            ServicePointDeactivation.service_point_id == new_sp_id,
+            ServicePointDeactivation.status == 'active',
+            ServicePointDeactivation.start_date <= assignment.date,
+            ServicePointDeactivation.end_date >= assignment.date
+        ).all()
+        for ad in active_deact:
+            if _shift_deactivation_overlaps(assignment.date, assignment.start_time, assignment.end_time,
+                                            assignment.is_cross_day, ad):
+                return jsonify({'error': f'目标服务点在{assignment.date}该时段也处于停用状态，无法改派'}), 409
+
+    old_user_id = assignment.user_id
+    old_sp_id = assignment.service_point_id
+    assignment.user_id = new_user_id
+
+    if new_sp_id:
+        assignment.service_point_id = new_sp_id
+
+    das.handle_status = 'reassigned_user'
+    das.handle_type = 'reassign_user'
+    das.new_user_id = new_user_id
+    if new_sp_id:
+        das.new_service_point_id = new_sp_id
+    das.handle_remark = data.get('remark',
+                                 f'由人员ID={old_user_id}改派至人员ID={new_user_id}' +
+                                 (f'，同时由服务点ID={old_sp_id}改派至服务点ID={new_sp_id}' if new_sp_id else ''))
+    das.handled_at = datetime.utcnow()
+
+    target_sp_id = new_sp_id if new_sp_id else assignment.service_point_id
     conflicts = detect_all_conflicts(
         user_id=new_user_id,
-        service_point_id=assignment.service_point_id,
+        service_point_id=target_sp_id,
         date=assignment.date,
         start_time=assignment.start_time,
         end_time=assignment.end_time,
@@ -310,23 +379,22 @@ def _handle_reassign_user(das, assignment, data):
 
     force = data.get('force', False)
     if conflicts and not force:
+        assignment.user_id = old_user_id
+        assignment.service_point_id = old_sp_id
+        das.handle_status = 'pending'
+        das.handle_type = None
+        das.new_user_id = None
+        das.new_service_point_id = None
+        das.handle_remark = None
+        das.handled_at = None
         return jsonify({
             'error': '改派给目标人员存在冲突',
             'conflicts': conflicts,
             'hint': '如需强制改派，请设置force=true'
         }), 409
 
-    old_user_id = assignment.user_id
-    assignment.user_id = new_user_id
-
-    das.handle_status = 'reassigned_user'
-    das.handle_type = 'reassign_user'
-    das.new_user_id = new_user_id
-    das.handle_remark = data.get('remark', f'由人员ID={old_user_id}改派至人员ID={new_user_id}')
-    das.handled_at = datetime.utcnow()
-
     if conflicts:
-        log_conflicts(conflicts, new_user_id, assignment.service_point_id, assignment.date, assignment.id)
+        log_conflicts(conflicts, new_user_id, target_sp_id, assignment.date, assignment.id)
 
     old_notifications = ScheduleNotification.query.filter(
         ScheduleNotification.duty_assignment_id == assignment.id,
@@ -337,16 +405,19 @@ def _handle_reassign_user(das, assignment, data):
         n.status = 'expired'
         n.expired_at = datetime.utcnow()
 
-    _notify_assignment_change(assignment, 'service_point_deactivation_reassign_user')
+    _notify_assignment_change(assignment, 'assignment')
 
     db.session.commit()
 
     result = {
-        'message': '已改派到其他人员',
+        'message': '已改派到其他人员' + ('及其他服务点' if new_sp_id else ''),
         'assignment_id': assignment.id,
         'new_user_id': new_user_id,
         'new_user_name': new_user.name
     }
+    if new_sp_id:
+        result['new_service_point_id'] = new_sp_id
+        result['new_service_point_name'] = new_sp.name
     if conflicts:
         result['warnings'] = [c.get('description', '') for c in conflicts]
     return jsonify(result), 200
@@ -355,11 +426,11 @@ def _handle_reassign_user(das, assignment, data):
 def _handle_cancel(das, assignment, data):
     assignment.status = 'cancelled'
 
-    pending_notifications = ScheduleNotification.query.filter(
+    all_notifications = ScheduleNotification.query.filter(
         ScheduleNotification.duty_assignment_id == assignment.id,
-        ScheduleNotification.status.in_(['unnotified', 'pending_confirm'])
+        ScheduleNotification.status.in_(['unnotified', 'pending_confirm', 'confirmed'])
     ).all()
-    for n in pending_notifications:
+    for n in all_notifications:
         n.status = 'expired'
         n.expired_at = datetime.utcnow()
 
@@ -394,10 +465,12 @@ def daily_overview():
     total_unhandled = 0
 
     for d in deactivations:
-        affected = d.affected_shifts.all()
-        pending_count = sum(1 for s in affected if s.handle_status == 'pending')
-        handled_count = sum(1 for s in affected if s.handle_status != 'pending')
-        total_affected += len(affected)
+        all_affected = d.affected_shifts.all()
+        day_affected = [s for s in all_affected
+                        if s.duty_assignment and s.duty_assignment.date == date]
+        pending_count = sum(1 for s in day_affected if s.handle_status == 'pending')
+        handled_count = len(day_affected) - pending_count
+        total_affected += len(day_affected)
         total_unhandled += pending_count
 
         overview.append({
@@ -406,11 +479,14 @@ def daily_overview():
             'service_point_name': d.service_point.name if d.service_point else None,
             'deactivation_start_date': d.start_date,
             'deactivation_end_date': d.end_date,
+            'deactivation_start_time': d.start_time,
+            'deactivation_end_time': d.end_time,
             'reason': d.reason,
-            'total_affected': len(affected),
+            'total_affected': len(day_affected),
             'pending_count': pending_count,
             'handled_count': handled_count,
-            'pending_shifts': [_serialize_affected_shift(s) for s in affected if s.handle_status == 'pending']
+            'pending_shifts': [_serialize_affected_shift(s)
+                               for s in day_affected if s.handle_status == 'pending']
         })
 
     return jsonify({
@@ -427,26 +503,39 @@ def daily_overview():
 def check_deactivation():
     service_point_id = request.args.get('service_point_id')
     date = request.args.get('date')
+    start_time = request.args.get('start_time')
+    end_time = request.args.get('end_time')
+    is_cross_day = request.args.get('is_cross_day', 'false').lower() == 'true'
     if not service_point_id or not date:
         return jsonify({'error': 'service_point_id和date为必填项'}), 400
 
-    active = ServicePointDeactivation.query.filter(
+    active_deactivations = ServicePointDeactivation.query.filter(
         ServicePointDeactivation.service_point_id == service_point_id,
         ServicePointDeactivation.status == 'active',
         ServicePointDeactivation.start_date <= date,
         ServicePointDeactivation.end_date >= date
-    ).first()
+    ).all()
 
-    if active:
+    matched = []
+    for ad in active_deactivations:
+        if start_time and end_time:
+            if not _shift_deactivation_overlaps(date, start_time, end_time, is_cross_day, ad):
+                continue
+        matched.append(ad)
+
+    if matched:
+        d = matched[0]
         return jsonify({
             'is_deactivated': True,
             'deactivation': {
-                'id': active.id,
-                'service_point_id': active.service_point_id,
-                'service_point_name': active.service_point.name if active.service_point else None,
-                'start_date': active.start_date,
-                'end_date': active.end_date,
-                'reason': active.reason
+                'id': d.id,
+                'service_point_id': d.service_point_id,
+                'service_point_name': d.service_point.name if d.service_point else None,
+                'start_date': d.start_date,
+                'end_date': d.end_date,
+                'start_time': d.start_time,
+                'end_time': d.end_time,
+                'reason': d.reason
             }
         }), 200
 
@@ -479,6 +568,39 @@ def _notify_assignment_change(assignment, notify_type_str):
         db.session.add(notification)
 
 
+def _deactivation_periods_overlap(start_date1, end_date1, start_time1, end_time1,
+                                  start_date2, end_date2, start_time2, end_time2):
+    if end_date1 < start_date2 or end_date2 < start_date1:
+        return False
+
+    if start_date1 == end_date1 and start_date2 == end_date2 and start_date1 == start_date2:
+        s1 = time_to_minutes(start_time1)
+        e1 = time_to_minutes(end_time1)
+        s2 = time_to_minutes(start_time2)
+        e2 = time_to_minutes(end_time2)
+        if e1 < s1:
+            e1 += 24 * 60
+        if e2 < s2:
+            e2 += 24 * 60
+        return s1 < e2 and s2 < e1
+
+    if start_date1 < end_date1 or start_date2 < end_date2:
+        return True
+
+    return True
+
+
+def _validate_time(t):
+    try:
+        parts = t.split(':')
+        if len(parts) != 2:
+            return False
+        h, m = int(parts[0]), int(parts[1])
+        return 0 <= h <= 23 and 0 <= m <= 59
+    except (ValueError, IndexError):
+        return False
+
+
 def _serialize_deactivation(d):
     total = d.affected_shifts.count()
     pending = d.affected_shifts.filter_by(handle_status='pending').count()
@@ -489,6 +611,8 @@ def _serialize_deactivation(d):
         'service_point_name': d.service_point.name if d.service_point else None,
         'start_date': d.start_date,
         'end_date': d.end_date,
+        'start_time': d.start_time,
+        'end_time': d.end_time,
         'reason': d.reason,
         'status': d.status,
         'total_affected': total,

@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from models import db, AttendanceRecord, DutyAssignment, ServicePointDeactivation
 from auth import login_required, role_required
+from conflict import _shift_deactivation_overlaps
 from datetime import datetime, timedelta
 
 att_bp = Blueprint('attendance', __name__, url_prefix='/api/attendance')
@@ -31,22 +32,26 @@ def check_in():
     if assignment.status == 'cancelled':
         return jsonify({'error': '已取消的排班不能签到'}), 400
 
-    active_deact = ServicePointDeactivation.query.filter(
+    active_deactivations = ServicePointDeactivation.query.filter(
         ServicePointDeactivation.service_point_id == assignment.service_point_id,
         ServicePointDeactivation.status == 'active',
         ServicePointDeactivation.start_date <= assignment.date,
         ServicePointDeactivation.end_date >= assignment.date
-    ).first()
-    if active_deact:
-        return jsonify({
-            'error': '该服务点已停用，不能签到',
-            'deactivation': {
-                'id': active_deact.id,
-                'start_date': active_deact.start_date,
-                'end_date': active_deact.end_date,
-                'reason': active_deact.reason
-            }
-        }), 409
+    ).all()
+    for ad in active_deactivations:
+        if _shift_deactivation_overlaps(assignment.date, assignment.start_time, assignment.end_time,
+                                        assignment.is_cross_day, ad):
+            return jsonify({
+                'error': '该服务点在班次时段内已停用，不能签到',
+                'deactivation': {
+                    'id': ad.id,
+                    'start_date': ad.start_date,
+                    'end_date': ad.end_date,
+                    'start_time': ad.start_time,
+                    'end_time': ad.end_time,
+                    'reason': ad.reason
+                }
+            }), 409
 
     existing = AttendanceRecord.query.filter_by(duty_assignment_id=assignment.id).first()
     if existing and existing.check_in_time:

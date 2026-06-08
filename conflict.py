@@ -320,15 +320,18 @@ def check_substitution_overlap(substitute_user_id, date, start_time, end_time, i
     return conflicts
 
 
-def check_deactivation_conflict(service_point_id, date):
+def check_deactivation_conflict(service_point_id, date, start_time=None, end_time=None, is_cross_day=False):
     conflicts = []
-    active_deact = ServicePointDeactivation.query.filter(
+    active_deactivations = ServicePointDeactivation.query.filter(
         ServicePointDeactivation.service_point_id == service_point_id,
         ServicePointDeactivation.status == 'active',
         ServicePointDeactivation.start_date <= date,
         ServicePointDeactivation.end_date >= date
-    ).first()
-    if active_deact:
+    ).all()
+    for active_deact in active_deactivations:
+        if start_time and end_time:
+            if not _shift_deactivation_overlaps(date, start_time, end_time, is_cross_day, active_deact):
+                continue
         sp = ServicePoint.query.get(service_point_id)
         conflicts.append({
             'type': 'deactivation',
@@ -336,11 +339,42 @@ def check_deactivation_conflict(service_point_id, date):
             'service_point_id': service_point_id,
             'description': (
                 f'服务点"{sp.name}"(ID={service_point_id})在{date}处于停用状态 '
-                f'(停用ID={active_deact.id}，{active_deact.start_date}至{active_deact.end_date}，'
+                f'(停用ID={active_deact.id}，{active_deact.start_date} {active_deact.start_time}至'
+                f'{active_deact.end_date} {active_deact.end_time}，'
                 f'原因：{active_deact.reason})'
             )
         })
     return conflicts
+
+
+def _shift_deactivation_overlaps(shift_date, shift_start, shift_end, shift_cross, deactivation):
+    if deactivation.end_date < shift_date or deactivation.start_date > shift_date:
+        return False
+    if deactivation.start_date == shift_date and deactivation.end_date == shift_date:
+        d_start = time_to_minutes(deactivation.start_time)
+        d_end = time_to_minutes(deactivation.end_time)
+        s_start = time_to_minutes(shift_start)
+        s_end = time_to_minutes(shift_end)
+        if shift_cross:
+            return s_start < d_end + 24 * 60 and d_start < s_end + 24 * 60
+        if s_end < s_start:
+            s_end += 24 * 60
+        if d_end < d_start:
+            d_end += 24 * 60
+        return s_start < d_end and d_start < s_end
+    if deactivation.start_date < shift_date:
+        if shift_cross:
+            return True
+        s_start = time_to_minutes(shift_start)
+        return s_start < time_to_minutes(deactivation.end_time)
+    if deactivation.end_date > shift_date:
+        if shift_cross:
+            return True
+        s_end = time_to_minutes(shift_end)
+        if s_end < time_to_minutes(shift_start):
+            s_end += 24 * 60
+        return time_to_minutes(deactivation.start_time) < s_end
+    return True
 
 
 def detect_all_conflicts(user_id, service_point_id, date, start_time, end_time,
@@ -361,7 +395,7 @@ def detect_all_conflicts(user_id, service_point_id, date, start_time, end_time,
                                                  is_cross_day, exclude_id)
         all_conflicts.extend(sub_overlap)
 
-    deactivation = check_deactivation_conflict(service_point_id, date)
+    deactivation = check_deactivation_conflict(service_point_id, date, start_time, end_time, is_cross_day)
     all_conflicts.extend(deactivation)
 
     return all_conflicts

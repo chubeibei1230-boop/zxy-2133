@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from models import db, DutyAssignment, User, ServicePoint, ScheduleNotification, ServicePointDeactivation
 from auth import login_required, role_required
-from conflict import detect_all_conflicts, log_conflicts
+from conflict import detect_all_conflicts, log_conflicts, _shift_deactivation_overlaps
 from datetime import datetime
 
 da_bp = Blueprint('duty_assignments', __name__, url_prefix='/api/duty-assignments')
@@ -28,28 +28,31 @@ def create():
     if not ServicePoint.query.get(data['service_point_id']):
         return jsonify({'error': '服务点不存在'}), 404
 
-    active_deact = ServicePointDeactivation.query.filter(
-        ServicePointDeactivation.service_point_id == data['service_point_id'],
-        ServicePointDeactivation.status == 'active',
-        ServicePointDeactivation.start_date <= data['date'],
-        ServicePointDeactivation.end_date >= data['date']
-    ).first()
-    if active_deact:
-        return jsonify({
-            'error': '该服务点在指定日期已停用，不允许新增排班',
-            'deactivation': {
-                'id': active_deact.id,
-                'start_date': active_deact.start_date,
-                'end_date': active_deact.end_date,
-                'reason': active_deact.reason
-            }
-        }), 409
-
     is_cross_day = data.get('is_cross_day', False)
     start = data['start_time']
     end = data['end_time']
     if start > end:
         is_cross_day = True
+
+    active_deactivations = ServicePointDeactivation.query.filter(
+        ServicePointDeactivation.service_point_id == data['service_point_id'],
+        ServicePointDeactivation.status == 'active',
+        ServicePointDeactivation.start_date <= data['date'],
+        ServicePointDeactivation.end_date >= data['date']
+    ).all()
+    for ad in active_deactivations:
+        if _shift_deactivation_overlaps(data['date'], start, end, is_cross_day, ad):
+            return jsonify({
+                'error': '该服务点在排班时段内已停用，不允许新增排班',
+                'deactivation': {
+                    'id': ad.id,
+                    'start_date': ad.start_date,
+                    'end_date': ad.end_date,
+                    'start_time': ad.start_time,
+                    'end_time': ad.end_time,
+                    'reason': ad.reason
+                }
+            }), 409
 
     conflicts = detect_all_conflicts(
         user_id=target_user_id,

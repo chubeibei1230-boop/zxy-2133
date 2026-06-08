@@ -217,6 +217,8 @@ class ServicePointDeactivation(db.Model):
     service_point_id = db.Column(db.Integer, db.ForeignKey('service_points.id'), nullable=False)
     start_date = db.Column(db.String(10), nullable=False)
     end_date = db.Column(db.String(10), nullable=False)
+    start_time = db.Column(db.String(5), nullable=False, default='00:00')
+    end_time = db.Column(db.String(5), nullable=False, default='23:59')
     reason = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(20), nullable=False, default='active')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
