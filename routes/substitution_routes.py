@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from models import db, Substitution, DutyAssignment, User
+from models import db, Substitution, DutyAssignment, User, ScheduleNotification
 from auth import login_required, role_required
 from conflict import check_substitution_overlap, log_conflicts
 
@@ -105,7 +105,9 @@ def list_all():
         'reason': s.reason,
         'status': s.status,
         'created_at': s.created_at.isoformat() if s.created_at else None,
-        'reviewed_at': s.reviewed_at.isoformat() if s.reviewed_at else None
+        'reviewed_at': s.reviewed_at.isoformat() if s.reviewed_at else None,
+        'notification_status': s.notifications[0].status if s.notifications and len(s.notifications) > 0 else None,
+        'notification_id': s.notifications[0].id if s.notifications and len(s.notifications) > 0 else None
     } for s in subs]), 200
 
 
@@ -141,6 +143,25 @@ def approve(s_id):
     from datetime import datetime
     s.status = 'approved'
     s.reviewed_at = datetime.utcnow()
+
+    original_notifications = ScheduleNotification.query.filter(
+        ScheduleNotification.duty_assignment_id == s.duty_assignment_id,
+        ScheduleNotification.user_id == s.original_user_id,
+        ScheduleNotification.status.in_(['unnotified', 'pending_confirm'])
+    ).all()
+    for n in original_notifications:
+        n.status = 'expired'
+        n.expired_at = datetime.utcnow()
+
+    notification = ScheduleNotification(
+        duty_assignment_id=s.duty_assignment_id,
+        substitution_id=s.id,
+        user_id=s.substitute_user_id,
+        notify_type='substitution',
+        status='unnotified'
+    )
+    db.session.add(notification)
+
     db.session.commit()
     return jsonify({'message': '替班申请已批准'}), 200
 

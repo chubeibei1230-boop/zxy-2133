@@ -121,6 +121,34 @@ class AttendanceRecord(db.Model):
         return ['on_time', 'late', 'absent']
 
 
+class ScheduleNotification(db.Model):
+    __tablename__ = 'schedule_notifications'
+
+    id = db.Column(db.Integer, primary_key=True)
+    duty_assignment_id = db.Column(db.Integer, db.ForeignKey('duty_assignments.id'), nullable=False)
+    substitution_id = db.Column(db.Integer, db.ForeignKey('substitutions.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    notify_type = db.Column(db.String(20), nullable=False, default='assignment')
+    status = db.Column(db.String(20), nullable=False, default='unnotified')
+    reject_reason = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    notified_at = db.Column(db.DateTime)
+    confirmed_at = db.Column(db.DateTime)
+    expired_at = db.Column(db.DateTime)
+
+    assignment = db.relationship('DutyAssignment', backref='notifications', lazy='joined')
+    substitution = db.relationship('Substitution', backref='notifications', lazy='joined')
+    user = db.relationship('User', backref='schedule_notifications', lazy='joined')
+
+    @staticmethod
+    def valid_statuses():
+        return ['unnotified', 'pending_confirm', 'confirmed', 'rejected', 'expired']
+
+    @staticmethod
+    def valid_notify_types():
+        return ['assignment', 'substitution']
+
+
 class ConflictLog(db.Model):
     __tablename__ = 'conflict_logs'
 

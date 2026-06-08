@@ -1,7 +1,8 @@
 from flask import Blueprint, request, jsonify
-from models import db, DutyAssignment, User, ServicePoint
+from models import db, DutyAssignment, User, ServicePoint, ScheduleNotification
 from auth import login_required, role_required
 from conflict import detect_all_conflicts, log_conflicts
+from datetime import datetime
 
 da_bp = Blueprint('duty_assignments', __name__, url_prefix='/api/duty-assignments')
 
@@ -61,6 +62,15 @@ def create():
     if conflicts:
         log_conflicts(conflicts, target_user_id, data['service_point_id'], data['date'], assignment.id)
 
+    notification = ScheduleNotification(
+        duty_assignment_id=assignment.id,
+        user_id=target_user_id,
+        notify_type='assignment',
+        status='unnotified'
+    )
+    db.session.add(notification)
+    db.session.commit()
+
     return jsonify({
         'message': '排班创建成功',
         'id': assignment.id,
@@ -119,7 +129,9 @@ def list_all():
         'start_time': a.start_time,
         'end_time': a.end_time,
         'status': a.status,
-        'is_cross_day': a.is_cross_day
+        'is_cross_day': a.is_cross_day,
+        'notification_status': a.notifications[0].status if a.notifications and len(a.notifications) > 0 else None,
+        'notification_id': a.notifications[0].id if a.notifications and len(a.notifications) > 0 else None
     } for a in assignments]), 200
 
 
@@ -139,7 +151,9 @@ def get_one(a_id):
         'start_time': a.start_time,
         'end_time': a.end_time,
         'status': a.status,
-        'is_cross_day': a.is_cross_day
+        'is_cross_day': a.is_cross_day,
+        'notification_status': a.notifications[0].status if a.notifications and len(a.notifications) > 0 else None,
+        'notification_id': a.notifications[0].id if a.notifications and len(a.notifications) > 0 else None
     }), 200
 
 
@@ -221,5 +235,14 @@ def cancel(a_id):
         return jsonify({'error': '该排班已取消'}), 400
 
     a.status = 'cancelled'
+
+    pending_notifications = ScheduleNotification.query.filter(
+        ScheduleNotification.duty_assignment_id == a_id,
+        ScheduleNotification.status.in_(['unnotified', 'pending_confirm'])
+    ).all()
+    for n in pending_notifications:
+        n.status = 'expired'
+        n.expired_at = datetime.utcnow()
+
     db.session.commit()
     return jsonify({'message': '排班已取消，占用时段已释放'}), 200
