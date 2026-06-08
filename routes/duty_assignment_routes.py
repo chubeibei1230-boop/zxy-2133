@@ -185,6 +185,10 @@ def update(a_id):
     a.service_point_id = new_sp_id
     a.is_cross_day = new_is_cross
     if 'user_id' in data:
+        if user.role != 'admin':
+            return jsonify({'error': '仅管理员可变更排班人员'}), 403
+        if data['user_id'] != a.user_id and not User.query.get(data['user_id']):
+            return jsonify({'error': '目标用户不存在'}), 404
         a.user_id = data['user_id']
     if 'status' in data:
         if data['status'] not in DutyAssignment.valid_statuses():

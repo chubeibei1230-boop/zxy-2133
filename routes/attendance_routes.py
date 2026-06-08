@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from models import db, AttendanceRecord, DutyAssignment
 from auth import login_required, role_required
-from datetime import datetime
+from datetime import datetime, timedelta
 
 att_bp = Blueprint('attendance', __name__, url_prefix='/api/attendance')
 
@@ -32,12 +32,35 @@ def check_in():
 
     now = datetime.utcnow()
     assignment_date = assignment.date
-    start_minutes = _time_to_minutes(assignment.start_time)
 
+    try:
+        shift_date = datetime.strptime(assignment_date, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': '排班日期格式异常'}), 400
+
+    today = now.date()
+    if shift_date > today:
+        return jsonify({'error': f'排班日期{assignment_date}尚未到达，不能提前签到'}), 400
+
+    if assignment.is_cross_day:
+        next_day_of_shift = shift_date + timedelta(days=1)
+        if now.date() > next_day_of_shift:
+            return jsonify({'error': f'排班{assignment_date}(跨日)已过期，不能签到'}), 400
+    else:
+        if today > shift_date:
+            return jsonify({'error': f'排班日期{assignment_date}已过期，不能签到'}), 400
+
+    start_minutes = _time_to_minutes(assignment.start_time)
     check_in_minutes = now.hour * 60 + now.minute
     status = 'on_time'
-    if check_in_minutes > start_minutes + 15:
-        status = 'late'
+
+    if now.date() == shift_date:
+        if check_in_minutes > start_minutes + 15:
+            status = 'late'
+    elif assignment.is_cross_day and now.date() == shift_date + timedelta(days=1):
+        end_minutes = _time_to_minutes(assignment.end_time)
+        if check_in_minutes > end_minutes:
+            status = 'late'
 
     record = AttendanceRecord(
         duty_assignment_id=assignment.id,

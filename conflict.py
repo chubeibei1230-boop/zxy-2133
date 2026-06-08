@@ -1,10 +1,20 @@
 from models import DutyAssignment, Substitution, ServicePoint, ConflictLog, db
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def time_to_minutes(time_str):
     parts = time_str.split(':')
     return int(parts[0]) * 60 + int(parts[1])
+
+
+def _previous_date(date_str):
+    dt = datetime.strptime(date_str, '%Y-%m-%d') - timedelta(days=1)
+    return dt.strftime('%Y-%m-%d')
+
+
+def _next_date(date_str):
+    dt = datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=1)
+    return dt.strftime('%Y-%m-%d')
 
 
 def intervals_overlap(start1, end1, start2, end2, cross1=False, cross2=False):
@@ -26,7 +36,7 @@ def intervals_overlap(start1, end1, start2, end2, cross1=False, cross2=False):
     return s1 < e2 and s2 < e1
 
 
-def get_effective_assignments(date, user_id=None, service_point_id=None, exclude_id=None):
+def _query_assignments(date, user_id=None, service_point_id=None, exclude_id=None):
     query = DutyAssignment.query.filter(
         DutyAssignment.date == date,
         DutyAssignment.status != 'cancelled'
@@ -38,6 +48,24 @@ def get_effective_assignments(date, user_id=None, service_point_id=None, exclude
     if exclude_id:
         query = query.filter(DutyAssignment.id != exclude_id)
     return query.all()
+
+
+def get_effective_assignments(date, user_id=None, service_point_id=None, exclude_id=None):
+    same_day = _query_assignments(date, user_id=user_id,
+                                  service_point_id=service_point_id, exclude_id=exclude_id)
+    prev_day_cross = _query_assignments(
+        _previous_date(date), user_id=user_id,
+        service_point_id=service_point_id, exclude_id=exclude_id
+    )
+    prev_day_cross = [a for a in prev_day_cross if a.is_cross_day]
+    return same_day + prev_day_cross
+
+
+def get_next_day_assignments(date, user_id=None, service_point_id=None, exclude_id=None):
+    return _query_assignments(
+        _next_date(date), user_id=user_id,
+        service_point_id=service_point_id, exclude_id=exclude_id
+    )
 
 
 def get_substitute_user_id(assignment_id):
@@ -53,22 +81,60 @@ def check_cross_point_conflict(user_id, date, start_time, end_time, is_cross_day
     own_assignments = get_effective_assignments(date, user_id=user_id, exclude_id=exclude_id)
 
     for a in own_assignments:
-        effective_user_id = user_id
         sub_user_id = get_substitute_user_id(a.id)
-        if sub_user_id:
-            effective_user_id = sub_user_id
-
+        effective_user_id = sub_user_id if sub_user_id else a.user_id
         if effective_user_id != user_id:
             continue
 
-        if intervals_overlap(start_time, end_time, a.start_time, a.end_time,
-                             is_cross_day, a.is_cross_day):
+        a_is_cross = a.is_cross_day
+        a_start = a.start_time
+        a_end = a.end_time
+        if a.date < date:
+            a_start_minutes = time_to_minutes(a.start_time)
+            if not a_is_cross and time_to_minutes(a.end_time) < a_start_minutes:
+                a_is_cross = True
+            a_start = '00:00'
+            a_is_cross = False
+
+        new_cross = is_cross_day
+        new_start = start_time
+        new_end = end_time
+        if is_cross_day:
+            if intervals_overlap(new_start, '23:59', a_start, a_end, False, a_is_cross):
+                conflicts.append({
+                    'type': 'cross_point',
+                    'conflicting_assignment_id': a.id,
+                    'service_point_id': a.service_point_id,
+                    'description': (
+                        f'人员ID={user_id} 在日期{a.date}已有服务点ID={a.service_point_id}的排班 '
+                        f'({a.start_time}-{a.end_time})，与新增时段({start_time}-{end_time})冲突'
+                    )
+                })
+            next_day_assignments = get_next_day_assignments(date, user_id=user_id, exclude_id=exclude_id)
+            for nd in next_day_assignments:
+                nd_sub = get_substitute_user_id(nd.id)
+                nd_effective = nd_sub if nd_sub else nd.user_id
+                if nd_effective != user_id:
+                    continue
+                if intervals_overlap('00:00', new_end, nd.start_time, nd.end_time, False, nd.is_cross_day):
+                    conflicts.append({
+                        'type': 'cross_point',
+                        'conflicting_assignment_id': nd.id,
+                        'service_point_id': nd.service_point_id,
+                        'description': (
+                            f'人员ID={user_id} 在次日{nd.date}已有服务点ID={nd.service_point_id}的排班 '
+                            f'({nd.start_time}-{nd.end_time})，与跨日排班({start_time}-{end_time})次日部分冲突'
+                        )
+                    })
+            continue
+
+        if intervals_overlap(new_start, new_end, a_start, a_end, new_cross, a_is_cross):
             conflicts.append({
                 'type': 'cross_point',
                 'conflicting_assignment_id': a.id,
                 'service_point_id': a.service_point_id,
                 'description': (
-                    f'人员ID={user_id} 在日期{date}已有服务点ID={a.service_point_id}的排班 '
+                    f'人员ID={user_id} 在日期{a.date}已有服务点ID={a.service_point_id}的排班 '
                     f'({a.start_time}-{a.end_time})，与新增时段({start_time}-{end_time})冲突'
                 )
             })
@@ -86,9 +152,32 @@ def check_over_limit_conflict(service_point_id, date, start_time, end_time, is_c
 
     overlapping = []
     for a in assignments:
-        if intervals_overlap(start_time, end_time, a.start_time, a.end_time,
-                             is_cross_day, a.is_cross_day):
-            overlapping.append(a)
+        a_is_cross = a.is_cross_day
+        a_start = a.start_time
+        a_end = a.end_time
+        if a.date < date:
+            if not a_is_cross and time_to_minutes(a.end_time) < time_to_minutes(a.start_time):
+                a_is_cross = True
+            a_start = '00:00'
+            a_is_cross = False
+
+        if is_cross_day:
+            day_part_overlap = intervals_overlap(start_time, '23:59', a_start, a_end, False, a_is_cross)
+            next_day_sp = get_next_day_assignments(date, service_point_id=service_point_id, exclude_id=exclude_id)
+            next_part_overlap = False
+            for nd in next_day_sp:
+                nd_cross = nd.is_cross_day
+                nd_start = nd.start_time
+                if nd.date > date and not nd_cross and time_to_minutes(nd.end_time) < time_to_minutes(nd.start_time):
+                    nd_cross = True
+                if intervals_overlap('00:00', end_time, nd_start, nd.end_time, False, nd_cross):
+                    next_part_overlap = True
+                    break
+            if day_part_overlap or next_part_overlap:
+                overlapping.append(a)
+        else:
+            if intervals_overlap(start_time, end_time, a_start, a_end, is_cross_day, a_is_cross):
+                overlapping.append(a)
 
     current_count = len(overlapping)
     if current_count >= sp.max_persons:
@@ -108,25 +197,123 @@ def check_over_limit_conflict(service_point_id, date, start_time, end_time, is_c
 
 def check_substitution_overlap(substitute_user_id, date, start_time, end_time, is_cross_day, exclude_id=None):
     conflicts = []
-    existing = get_effective_assignments(date, user_id=substitute_user_id, exclude_id=exclude_id)
 
-    for a in existing:
+    own_assignments = get_effective_assignments(date, user_id=substitute_user_id, exclude_id=exclude_id)
+    for a in own_assignments:
         sub_for_a = get_substitute_user_id(a.id)
         effective_user = sub_for_a if sub_for_a else a.user_id
-
         if effective_user != substitute_user_id:
             continue
 
-        if intervals_overlap(start_time, end_time, a.start_time, a.end_time,
-                             is_cross_day, a.is_cross_day):
+        a_is_cross = a.is_cross_day
+        a_start = a.start_time
+        a_end = a.end_time
+        if a.date < date:
+            if not a_is_cross and time_to_minutes(a.end_time) < time_to_minutes(a.start_time):
+                a_is_cross = True
+            a_start = '00:00'
+            a_is_cross = False
+
+        if intervals_overlap(start_time, end_time, a_start, a_end, is_cross_day, a_is_cross):
             conflicts.append({
                 'type': 'substitution_overlap',
                 'conflicting_assignment_id': a.id,
                 'original_user_id': a.user_id,
                 'description': (
-                    f'替班人员ID={substitute_user_id}在日期{date}已有排班 '
+                    f'替班人员ID={substitute_user_id}在日期{a.date}已有排班 '
                     f'(服务点ID={a.service_point_id}, {a.start_time}-{a.end_time})，'
                     f'与替班时段({start_time}-{end_time})冲突'
+                )
+            })
+
+    approved_subs = Substitution.query.filter(
+        Substitution.substitute_user_id == substitute_user_id,
+        Substitution.status == 'approved'
+    ).all()
+    sub_assignment_ids = [s.duty_assignment_id for s in approved_subs]
+    if exclude_id and exclude_id in sub_assignment_ids:
+        sub_assignment_ids = [sid for sid in sub_assignment_ids if sid != exclude_id]
+
+    if sub_assignment_ids:
+        sub_assignments = DutyAssignment.query.filter(
+            DutyAssignment.id.in_(sub_assignment_ids),
+            DutyAssignment.status != 'cancelled'
+        ).all()
+        for a in sub_assignments:
+            if a.user_id == substitute_user_id:
+                continue
+
+            a_is_cross = a.is_cross_day
+            a_start = a.start_time
+            a_end = a.end_time
+            overlap_date = a.date
+            if a.date < date:
+                if not a_is_cross and time_to_minutes(a.end_time) < time_to_minutes(a.start_time):
+                    a_is_cross = True
+                a_start = '00:00'
+                a_is_cross = False
+            elif a.date == date:
+                pass
+            else:
+                continue
+
+            if is_cross_day:
+                day_overlap = intervals_overlap(start_time, '23:59', a_start, a_end, False, a_is_cross)
+                if day_overlap:
+                    conflicts.append({
+                        'type': 'substitution_overlap',
+                        'conflicting_assignment_id': a.id,
+                        'original_user_id': a.user_id,
+                        'description': (
+                            f'替班人员ID={substitute_user_id}已在日期{overlap_date}替ID={a.user_id}值班 '
+                            f'(服务点ID={a.service_point_id}, {a.start_time}-{a.end_time})，'
+                            f'与新增替班时段({start_time}-{end_time})冲突'
+                        )
+                    })
+            else:
+                if intervals_overlap(start_time, end_time, a_start, a_end, is_cross_day, a_is_cross):
+                    conflicts.append({
+                        'type': 'substitution_overlap',
+                        'conflicting_assignment_id': a.id,
+                        'original_user_id': a.user_id,
+                        'description': (
+                            f'替班人员ID={substitute_user_id}已在日期{overlap_date}替ID={a.user_id}值班 '
+                            f'(服务点ID={a.service_point_id}, {a.start_time}-{a.end_time})，'
+                            f'与新增替班时段({start_time}-{end_time})冲突'
+                        )
+                    })
+
+    pending_subs = Substitution.query.filter(
+        Substitution.substitute_user_id == substitute_user_id,
+        Substitution.status == 'pending'
+    ).all()
+    for ps in pending_subs:
+        pa = DutyAssignment.query.get(ps.duty_assignment_id)
+        if not pa or pa.status == 'cancelled':
+            continue
+        if pa.user_id == substitute_user_id:
+            continue
+
+        pa_is_cross = pa.is_cross_day
+        pa_start = pa.start_time
+        pa_end = pa.end_time
+        if pa.date < date:
+            if not pa_is_cross and time_to_minutes(pa.end_time) < time_to_minutes(pa.start_time):
+                pa_is_cross = True
+            pa_start = '00:00'
+            pa_is_cross = False
+        elif pa.date != date:
+            continue
+
+        if intervals_overlap(start_time, end_time, pa_start, pa_end, is_cross_day, pa_is_cross):
+            conflicts.append({
+                'type': 'substitution_overlap',
+                'conflicting_assignment_id': pa.id,
+                'original_user_id': pa.user_id,
+                'description': (
+                    f'替班人员ID={substitute_user_id}已有待审批替班(替ID={pa.user_id}，'
+                    f'服务点ID={pa.service_point_id}, {pa.start_time}-{pa.end_time})，'
+                    f'与新增替班时段({start_time}-{end_time})可能冲突'
                 )
             })
 
